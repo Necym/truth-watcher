@@ -1,18 +1,14 @@
 services:
   - type: web
     name: render-truth-watcher
-    env: node
+    runtime: docker
     plan: free
-    buildCommand: npm install && npx playwright install --with-deps chromium
-    startCommand: npm start
-    healthCheckPath: /health
+    autoDeploy: true
     envVars:
-      - key: NODE_VERSION
-        value: 20
       - key: PROFILE_URL
         value: https://truthsocial.com/@realDonaldTrump
       - key: POLL_MS
-        value: 10000
+        value: "10000"
       - key: DISCORD_WEBHOOK_URL
         sync: false
       - key: TELEGRAM_BOT_TOKEN
