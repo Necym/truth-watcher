@@ -1,9 +1,7 @@
 import express from "express";
-
 import { chromium } from "playwright";
 
 const app = express();
-
 
 const PORT = process.env.PORT || 3000;
 const PROFILE_URL = process.env.PROFILE_URL || "https://truthsocial.com/@realDonaldTrump";
@@ -12,9 +10,11 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
-let browser;
-let page;
-let status = {
+let browser = null;
+let page = null;
+let timer = null;
+
+const status = {
   running: false,
   lastCheckAt: null,
   lastPostUrl: null,
@@ -24,7 +24,7 @@ let status = {
 };
 
 function escapeHtml(str = "") {
-  return str
+  return String(str)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -32,36 +32,51 @@ function escapeHtml(str = "") {
     .replaceAll("'", "&#39;");
 }
 
+function addError(error) {
+  status.errors.unshift({
+    at: new Date().toISOString(),
+    error: error?.message || String(error),
+  });
+  status.errors = status.errors.slice(0, 20);
+}
+
 function extractPostLinks(hrefs) {
   const set = new Set();
+
   for (let href of hrefs) {
     if (!href) continue;
     if (href.startsWith("/")) href = `https://truthsocial.com${href}`;
+
     if (/^https:\/\/truthsocial\.com\/@realDonaldTrump\/posts\/\d+$/.test(href)) {
       set.add(href);
     }
   }
+
   return [...set].sort((a, b) => {
-    const ai = Number(a.split("/").pop());
-    const bi = Number(b.split("/").pop());
-    return bi - ai;
+    const aId = Number(a.split("/").pop());
+    const bId = Number(b.split("/").pop());
+    return bId - aId;
   });
 }
 
 async function sendDiscord(message) {
   if (!DISCORD_WEBHOOK_URL) return;
-  const res = await fetch(DISCORD_WEBHOOK_URL, {
+
+  const response = await fetch(DISCORD_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content: message }),
   });
-  if (!res.ok) throw new Error(`Discord webhook failed: ${res.status}`);
+
+  if (!response.ok) {
+    throw new Error(`Discord webhook failed: ${response.status}`);
+  }
 }
 
 async function sendTelegram(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  const res = await fetch(url, {
+
+  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -70,7 +85,10 @@ async function sendTelegram(message) {
       disable_web_page_preview: true,
     }),
   });
-  if (!res.ok) throw new Error(`Telegram send failed: ${res.status}`);
+
+  if (!response.ok) {
+    throw new Error(`Telegram send failed: ${response.status}`);
+  }
 }
 
 async function notifyNewPost(url) {
@@ -81,33 +99,43 @@ async function notifyNewPost(url) {
   ]);
 
   const failures = results
-    .filter(r => r.status === "rejected")
-    .map(r => r.reason?.message || String(r.reason));
+    .filter((result) => result.status === "rejected")
+    .map((result) => result.reason?.message || String(result.reason));
 
   if (failures.length) {
-    status.errors.unshift({ at: new Date().toISOString(), error: failures.join(" | ") });
-    status.errors = status.errors.slice(0, 20);
+    addError(failures.join(" | "));
   }
 }
 
 async function ensureBrowser() {
-  if (browser) return;
-  browser = await chromium.launch({ headless: true });
+  if (browser && page) return;
+
+  browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  });
+
   const context = await browser.newContext({
     viewport: { width: 1400, height: 2000 },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   });
+
   page = await context.newPage();
 }
 
 async function fetchLatestPost() {
   await ensureBrowser();
-  await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+  await page.goto(PROFILE_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 45000,
+  });
+
   await page.waitForTimeout(3000);
 
-  const hrefs = await page.$$eval("a", els =>
-    els.map(a => a.href || a.getAttribute("href") || "").filter(Boolean)
+  const hrefs = await page.$$eval("a", (elements) =>
+    elements.map((a) => a.href || a.getAttribute("href") || "").filter(Boolean)
   );
 
   const postLinks = extractPostLinks(hrefs);
@@ -115,63 +143,88 @@ async function fetchLatestPost() {
 
   const latestUrl = postLinks[0];
   const latestId = latestUrl.split("/").pop();
+
   return { latestUrl, latestId };
 }
 
 async function pollOnce() {
   status.lastCheckAt = new Date().toISOString();
+
   try {
     const latest = await fetchLatestPost();
-    if (!latest) throw new Error("No post links found on page");
+
+    if (!latest) {
+      throw new Error("No post links found on page");
+    }
 
     if (!status.lastPostId) {
       status.lastPostId = latest.latestId;
       status.lastPostUrl = latest.latestUrl;
-    } else if (latest.latestId !== status.lastPostId) {
+      return;
+    }
+
+    if (latest.latestId !== status.lastPostId) {
       status.lastPostId = latest.latestId;
       status.lastPostUrl = latest.latestUrl;
-      status.detections.unshift({ at: new Date().toISOString(), url: latest.latestUrl });
+      status.detections.unshift({
+        at: new Date().toISOString(),
+        url: latest.latestUrl,
+      });
       status.detections = status.detections.slice(0, 50);
       await notifyNewPost(latest.latestUrl);
     }
-
-rror = err?.message || String(err);
-    status.errors.unshift({ at: new Date().toISOString(), error });
-    status.errors = status.errors.slice(0, 20);
-
+  } catch (error) {
+    addError(error);
   }
 }
 
-let timer = null;
 async function startWatcher() {
-  if (timer) return;
+  if (timer) {
+    status.running = true;
+    return;
+  }
+
   status.running = true;
   await pollOnce();
+
   timer = setInterval(() => {
-    pollOnce().catch(() => {});
+    pollOnce().catch(addError);
   }, POLL_MS);
 }
 
 async function stopWatcher() {
   status.running = false;
-  if (timer) clearInterval(timer);
-  timer = null;
+
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
 }
+
+app.use(express.json());
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, status });
 });
 
-app.use(express.json());
-
 app.post("/start", async (_req, res) => {
-  await startWatcher();
-  res.json({ ok: true, status });
+  try {
+    await startWatcher();
+    res.json({ ok: true, status });
+  } catch (error) {
+    addError(error);
+    res.status(500).json({ ok: false, error: error?.message || String(error), status });
+  }
 });
 
 app.post("/stop", async (_req, res) => {
-  await stopWatcher();
-  res.json({ ok: true, status });
+  try {
+    await stopWatcher();
+    res.json({ ok: true, status });
+  } catch (error) {
+    addError(error);
+    res.status(500).json({ ok: false, error: error?.message || String(error), status });
+  }
 });
 
 app.get("/", (_req, res) => {
@@ -198,7 +251,7 @@ app.get("/", (_req, res) => {
   <body>
     <div class="wrap">
       <h1>Truth Social Watcher</h1>
-      <p class="muted">Web dashboard + live notifications for new posts from <code>${escapeHtml(PROFILE_URL)}</code>.</p>
+      <p class="muted">Web dashboard plus optional Discord and Telegram notifications for <code>${escapeHtml(PROFILE_URL)}</code>.</p>
 
       <div class="card">
         <div style="margin-bottom:12px;">
@@ -229,71 +282,71 @@ app.get("/", (_req, res) => {
     </div>
 
     <script>
-      let refreshTimer = null;
-
       function setText(id, value) {
         document.getElementById(id).textContent = value;
       }
 
       function renderList(id, items, mapper) {
         const el = document.getElementById(id);
-        el.innerHTML = items.length
-          ? items.map(mapper).join("")
-          : '<li class="muted">None</li>';
+        el.innerHTML = items.length ? items.map(mapper).join("") : '<li class="muted">None</li>';
       }
 
       function renderStatus(status) {
         setText("running", String(status.running));
         setText("lastCheck", status.lastCheckAt || "never");
+
         const latest = document.getElementById("latestUrl");
         if (status.lastPostUrl) {
           latest.innerHTML = '<a href="' + status.lastPostUrl + '" target="_blank" rel="noopener noreferrer">' + status.lastPostUrl + '</a>';
         } else {
-          latest.textContent = 'None yet';
+          latest.textContent = "None yet";
         }
 
-        renderList("detections", status.detections || [], item =>
-          '<li><a href="' + item.url + '" target="_blank" rel="noopener noreferrer">' + item.url + '</a> <span class="muted">(' + item.at + ')</span></li>'
-        );
+        renderList("detections", status.detections || [], function (item) {
+          return '<li><a href="' + item.url + '" target="_blank" rel="noopener noreferrer">' + item.url + '</a> <span class="muted">(' + item.at + ')</span></li>';
+        });
 
-        renderList("errors", status.errors || [], item =>
-          '<li>' + item.error + ' <span class="muted">(' + item.at + ')</span></li>'
-        );
+        renderList("errors", status.errors || [], function (item) {
+          return '<li>' + item.error + ' <span class="muted">(' + item.at + ')</span></li>';
+        });
       }
 
-      
+      async function refreshStatus() {
+        const res = await fetch("/health");
+        const data = await res.json();
+        renderStatus(data.status);
+      }
 
       window.startWatcher = async function () {
-        const res = await fetch('/start', { method: 'POST' });
+        const res = await fetch("/start", { method: "POST" });
         const data = await res.json();
         renderStatus(data.status);
       };
 
       window.stopWatcher = async function () {
-        const res = await fetch('/stop', { method: 'POST' });
+        const res = await fetch("/stop", { method: "POST" });
         const data = await res.json();
         renderStatus(data.status);
       };
 
-      document.getElementById('startBtn').addEventListener('click', window.startWatcher);
-      document.getElementById('stopBtn').addEventListener('click', window.stopWatcher);
-
-      async function refreshStatus() {
-        const res = await fetch('/health');
-        const data = await res.json();
-        renderStatus(data.status);
-      }
+      document.getElementById("startBtn").addEventListener("click", window.startWatcher);
+      document.getElementById("stopBtn").addEventListener("click", window.stopWatcher);
 
       refreshStatus();
-      refreshTimer = setInterval(refreshStatus, 3000);
+      setInterval(refreshStatus, 3000);
     </script>
   </body>
 </html>`);
 });
 
 app.listen(PORT, async () => {
-  console.log(`Watcher UI running on http://localhost:${PORT}`);
-  await startWatcher();
+  console.log(\`Watcher UI running on http://localhost:\${PORT}\`);
+  try {
+    await startWatcher();
+  } catch (error) {
+    addError(error);
+    console.error(error);
+  }
 });
 
 process.on("SIGINT", async () => {
