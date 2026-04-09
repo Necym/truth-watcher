@@ -1,5 +1,6 @@
 import express from "express";
 import { chromium } from "playwright";
+import fs from "fs/promises";
 
 const app = express();
 
@@ -21,8 +22,12 @@ const status = {
   errors: [],
   debug: {
     currentPageUrl: null,
+    pageTitle: null,
+    bodyTextSnippet: null,
+    htmlSnippet: null,
     postCount: 0,
     samplePosts: [],
+    screenshotPath: null,
     lastSuccessfulFetchAt: null,
   },
 };
@@ -46,19 +51,23 @@ function addError(err) {
   console.error(message);
 }
 
-function normalizeTruthUrl(href) {
-  if (!href) return null;
-  if (href.startsWith("http://") || href.startsWith("https://")) return href;
-  if (href.startsWith("/")) return "https://truthsocial.com" + href;
-  return "https://truthsocial.com/" + href;
-}
+async function writeFailureArtifacts() {
+  if (!page) return;
 
-function sortPostsDescending(posts) {
-  return [...posts].sort((a, b) => {
-    const aId = Number(a.postId || 0);
-    const bId = Number(b.postId || 0);
-    return bId - aId;
-  });
+  try {
+    const screenshotPath = "/tmp/truthsocial-failure.png";
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    status.debug.screenshotPath = screenshotPath;
+  } catch (err) {
+    addError("Failed to write screenshot: " + (err?.message || String(err)));
+  }
+
+  try {
+    const html = await page.content();
+    await fs.writeFile("/tmp/truthsocial-failure.html", html, "utf8");
+  } catch (err) {
+    addError("Failed to write HTML: " + (err?.message || String(err)));
+  }
 }
 
 async function sendDiscord(message) {
@@ -97,19 +106,30 @@ async function ensureBrowser() {
   page = await context.newPage();
 }
 
+function sortPostsDescending(posts) {
+  return [...posts].sort((a, b) => Number(b.postId || 0) - Number(a.postId || 0));
+}
+
 async function fetchLatestPost() {
   await ensureBrowser();
 
   await page.goto(PROFILE_URL, {
-    waitUntil: "networkidle",
+    waitUntil: "domcontentloaded",
     timeout: 60000,
   });
 
-  await page.waitForTimeout(10000);
+  await page.waitForTimeout(12000);
 
-  await page.waitForSelector('div[data-id]', { timeout: 15000 });
+  status.debug.currentPageUrl = page.url();
+  status.debug.pageTitle = await page.title();
 
-  const posts = await page.$$eval('div[data-id]', (elements) => {
+  const bodyText = await page.locator("body").innerText().catch(() => "");
+  status.debug.bodyTextSnippet = String(bodyText || "").slice(0, 2000);
+
+  const html = await page.content();
+  status.debug.htmlSnippet = String(html || "").slice(0, 4000);
+
+  const posts = await page.$$eval("div[data-id]", (elements) => {
     function normalizeHref(href) {
       if (!href) return null;
       if (href.startsWith("http://") || href.startsWith("https://")) return href;
@@ -123,10 +143,7 @@ async function fetchLatestPost() {
       const postId = el.getAttribute("data-id");
       if (!postId) continue;
 
-      const postLinkEl =
-        el.querySelector('a[href*="/posts/"]') ||
-        el.querySelector('a.hover\\:underline[href]');
-
+      const postLinkEl = el.querySelector('a[href*="/posts/"]');
       const href = postLinkEl ? postLinkEl.getAttribute("href") : null;
       const postUrl = normalizeHref(href);
 
@@ -143,16 +160,19 @@ async function fetchLatestPost() {
     return out;
   });
 
-  status.debug.currentPageUrl = page.url();
   status.debug.postCount = posts.length;
   status.debug.samplePosts = posts.slice(0, 5);
 
   console.log("Page URL:", status.debug.currentPageUrl);
+  console.log("Page title:", status.debug.pageTitle);
+  console.log("Body snippet:", status.debug.bodyTextSnippet);
   console.log("Post count:", status.debug.postCount);
   console.log("Sample posts:", JSON.stringify(status.debug.samplePosts, null, 2));
 
   const validPosts = posts.filter((p) => p.postId && p.postUrl);
+
   if (!validPosts.length) {
+    await writeFailureArtifacts();
     return null;
   }
 
@@ -177,7 +197,7 @@ async function pollOnce() {
 
     if (!latest || !latest.latestId || !latest.latestUrl) {
       throw new Error(
-        "No valid posts found on page. Post containers were missing a usable data-id or /posts/ link."
+        "No valid posts found on page. Check Debug for page title/body/html snippet."
       );
     }
 
@@ -258,7 +278,7 @@ function renderPage() {
     "      .muted { color: #a9b5d1; }",
     "      .row { display: flex; gap: 12px; flex-wrap: wrap; }",
     "      .pill { background: #1c264b; border: 1px solid #2b3865; border-radius: 999px; padding: 6px 10px; }",
-    "      pre { white-space: pre-wrap; word-break: break-word; background: #0d1430; padding: 12px; border-radius: 12px; border: 1px solid #243056; }",
+    "      pre { white-space: pre-wrap; word-break: break-word; background: #0d1430; padding: 12px; border-radius: 12px; border: 1px solid #243056; max-height: 280px; overflow: auto; }",
     "    </style>",
     "  </head>",
     "  <body>",
@@ -292,10 +312,18 @@ function renderPage() {
     "        <h3>Debug</h3>",
     '        <div class="muted">Page URL</div>',
     '        <pre id="debugPageUrl">None</pre>',
+    '        <div class="muted">Page title</div>',
+    '        <pre id="debugPageTitle">None</pre>',
+    '        <div class="muted">Body text snippet</div>',
+    '        <pre id="debugBodyText">None</pre>',
+    '        <div class="muted">HTML snippet</div>',
+    '        <pre id="debugHtmlSnippet">None</pre>',
     '        <div class="muted">Post count</div>',
     '        <pre id="debugPostCount">0</pre>',
     '        <div class="muted">Sample posts</div>',
     '        <pre id="debugSamplePosts">[]</pre>',
+    '        <div class="muted">Failure screenshot path</div>',
+    '        <pre id="debugScreenshotPath">None</pre>',
     "      </div>",
     "    </div>",
     "    <script>",
@@ -323,8 +351,12 @@ function renderPage() {
     "          return '<li>' + item.error + ' <span class=\"muted\">(' + item.at + ')</span></li>';",
     "        });",
     "        setText('debugPageUrl', (status.debug && status.debug.currentPageUrl) || 'None');",
+    "        setText('debugPageTitle', (status.debug && status.debug.pageTitle) || 'None');",
+    "        setText('debugBodyText', (status.debug && status.debug.bodyTextSnippet) || 'None');",
+    "        setText('debugHtmlSnippet', (status.debug && status.debug.htmlSnippet) || 'None');",
     "        setText('debugPostCount', String((status.debug && status.debug.postCount) || 0));",
     "        setText('debugSamplePosts', JSON.stringify((status.debug && status.debug.samplePosts) || [], null, 2));",
+    "        setText('debugScreenshotPath', (status.debug && status.debug.screenshotPath) || 'None');",
     "      }",
     "      async function refreshStatus() {",
     "        var res = await fetch('/health');",
@@ -400,8 +432,6 @@ app.listen(PORT, async () => {
 
 process.on("SIGINT", async () => {
   await stopWatcher();
-  if (browser) {
-    await browser.close();
-  }
+  if (browser) await browser.close();
   process.exit(0);
 });
