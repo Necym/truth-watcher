@@ -21,8 +21,8 @@ const status = {
   errors: [],
   debug: {
     currentPageUrl: null,
-    hrefCount: 0,
-    sampleHrefs: [],
+    postCount: 0,
+    samplePosts: [],
     lastSuccessfulFetchAt: null,
   },
 };
@@ -46,35 +46,19 @@ function addError(err) {
   console.error(message);
 }
 
-function extractPostLinks(hrefs) {
-  const urls = [];
-  const seen = new Set();
+function normalizeTruthUrl(href) {
+  if (!href) return null;
+  if (href.startsWith("http://") || href.startsWith("https://")) return href;
+  if (href.startsWith("/")) return "https://truthsocial.com" + href;
+  return "https://truthsocial.com/" + href;
+}
 
-  for (let href of hrefs) {
-    if (!href) continue;
-
-    if (href.startsWith("/")) {
-      href = "https://truthsocial.com" + href;
-    }
-
-    const isTruthSocial = href.includes("truthsocial.com/");
-    const looksLikePost = /\/posts\/\d+/.test(href);
-
-    if (isTruthSocial && looksLikePost && !seen.has(href)) {
-      seen.add(href);
-      urls.push(href);
-    }
-  }
-
-  urls.sort((a, b) => {
-    const aMatch = a.match(/\/posts\/(\d+)/);
-    const bMatch = b.match(/\/posts\/(\d+)/);
-    const aId = aMatch ? Number(aMatch[1]) : 0;
-    const bId = bMatch ? Number(bMatch[1]) : 0;
+function sortPostsDescending(posts) {
+  return [...posts].sort((a, b) => {
+    const aId = Number(a.postId || 0);
+    const bId = Number(b.postId || 0);
     return bId - aId;
   });
-
-  return urls;
 }
 
 async function sendDiscord(message) {
@@ -93,8 +77,7 @@ async function sendDiscord(message) {
 
 async function notifyNewPost(url) {
   if (!DISCORD_WEBHOOK_URL) return;
-  const message = "New Trump Truth Social post detected\n" + url;
-  await sendDiscord(message);
+  await sendDiscord("New Trump Truth Social post detected\n" + url);
 }
 
 async function ensureBrowser() {
@@ -106,7 +89,7 @@ async function ensureBrowser() {
   });
 
   const context = await browser.newContext({
-    viewport: { width: 1400, height: 2000 },
+    viewport: { width: 1440, height: 2200 },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   });
@@ -118,34 +101,70 @@ async function fetchLatestPost() {
   await ensureBrowser();
 
   await page.goto(PROFILE_URL, {
-    waitUntil: "domcontentloaded",
-    timeout: 45000,
+    waitUntil: "networkidle",
+    timeout: 60000,
   });
 
-  await page.waitForTimeout(8000);
+  await page.waitForTimeout(10000);
 
-  const hrefs = await page.$$eval("a", (elements) =>
-    elements.map((a) => a.href || a.getAttribute("href") || "").filter(Boolean)
-  );
+  await page.waitForSelector('div[data-id]', { timeout: 15000 });
+
+  const posts = await page.$$eval('div[data-id]', (elements) => {
+    function normalizeHref(href) {
+      if (!href) return null;
+      if (href.startsWith("http://") || href.startsWith("https://")) return href;
+      if (href.startsWith("/")) return "https://truthsocial.com" + href;
+      return "https://truthsocial.com/" + href;
+    }
+
+    const out = [];
+
+    for (const el of elements) {
+      const postId = el.getAttribute("data-id");
+      if (!postId) continue;
+
+      const postLinkEl =
+        el.querySelector('a[href*="/posts/"]') ||
+        el.querySelector('a.hover\\:underline[href]');
+
+      const href = postLinkEl ? postLinkEl.getAttribute("href") : null;
+      const postUrl = normalizeHref(href);
+
+      const textNode = el.querySelector('[data-testid="markup"]');
+      const text = textNode ? (textNode.textContent || "").trim() : "";
+
+      out.push({
+        postId,
+        postUrl,
+        textPreview: text.slice(0, 180),
+      });
+    }
+
+    return out;
+  });
 
   status.debug.currentPageUrl = page.url();
-  status.debug.hrefCount = hrefs.length;
-  status.debug.sampleHrefs = hrefs.slice(0, 20);
+  status.debug.postCount = posts.length;
+  status.debug.samplePosts = posts.slice(0, 5);
 
   console.log("Page URL:", status.debug.currentPageUrl);
-  console.log("Found href count:", status.debug.hrefCount);
-  console.log("Sample hrefs:", status.debug.sampleHrefs);
+  console.log("Post count:", status.debug.postCount);
+  console.log("Sample posts:", JSON.stringify(status.debug.samplePosts, null, 2));
 
-  const postLinks = extractPostLinks(hrefs);
-  if (!postLinks.length) {
+  const validPosts = posts.filter((p) => p.postId && p.postUrl);
+  if (!validPosts.length) {
     return null;
   }
+
+  const sorted = sortPostsDescending(validPosts);
+  const latest = sorted[0];
 
   status.debug.lastSuccessfulFetchAt = new Date().toISOString();
 
   return {
-    latestUrl: postLinks[0],
-    latestId: postLinks[0].match(/\/posts\/(\d+)/)?.[1] || null,
+    latestId: latest.postId,
+    latestUrl: latest.postUrl,
+    latestTextPreview: latest.textPreview || "",
   };
 }
 
@@ -156,9 +175,9 @@ async function pollOnce() {
     const previousPostId = status.lastPostId;
     const latest = await fetchLatestPost();
 
-    if (!latest || !latest.latestId) {
+    if (!latest || !latest.latestId || !latest.latestUrl) {
       throw new Error(
-        "No post links found on page. Truth Social may be rendering a different layout, an interstitial, or delayed content."
+        "No valid posts found on page. Post containers were missing a usable data-id or /posts/ link."
       );
     }
 
@@ -273,10 +292,10 @@ function renderPage() {
     "        <h3>Debug</h3>",
     '        <div class="muted">Page URL</div>',
     '        <pre id="debugPageUrl">None</pre>',
-    '        <div class="muted">Href count</div>',
-    '        <pre id="debugHrefCount">0</pre>',
-    '        <div class="muted">Sample hrefs</div>',
-    '        <pre id="debugSampleHrefs">[]</pre>',
+    '        <div class="muted">Post count</div>',
+    '        <pre id="debugPostCount">0</pre>',
+    '        <div class="muted">Sample posts</div>',
+    '        <pre id="debugSamplePosts">[]</pre>',
     "      </div>",
     "    </div>",
     "    <script>",
@@ -304,8 +323,8 @@ function renderPage() {
     "          return '<li>' + item.error + ' <span class=\"muted\">(' + item.at + ')</span></li>';",
     "        });",
     "        setText('debugPageUrl', (status.debug && status.debug.currentPageUrl) || 'None');",
-    "        setText('debugHrefCount', String((status.debug && status.debug.hrefCount) || 0));",
-    "        setText('debugSampleHrefs', JSON.stringify((status.debug && status.debug.sampleHrefs) || [], null, 2));",
+    "        setText('debugPostCount', String((status.debug && status.debug.postCount) || 0));",
+    "        setText('debugSamplePosts', JSON.stringify((status.debug && status.debug.samplePosts) || [], null, 2));",
     "      }",
     "      async function refreshStatus() {",
     "        var res = await fetch('/health');",
