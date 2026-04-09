@@ -1,11 +1,9 @@
 import express from "express";
-import http from "http";
-import { Server } from "socket.io";
+
 import { chromium } from "playwright";
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
+
 
 const PORT = process.env.PORT || 3000;
 const PROFILE_URL = process.env.PROFILE_URL || "https://truthsocial.com/@realDonaldTrump";
@@ -134,16 +132,13 @@ async function pollOnce() {
       status.lastPostUrl = latest.latestUrl;
       status.detections.unshift({ at: new Date().toISOString(), url: latest.latestUrl });
       status.detections = status.detections.slice(0, 50);
-      io.emit("new_post", { at: new Date().toISOString(), url: latest.latestUrl });
       await notifyNewPost(latest.latestUrl);
     }
 
-    io.emit("status", status);
-  } catch (err) {
-    const error = err?.message || String(err);
+rror = err?.message || String(err);
     status.errors.unshift({ at: new Date().toISOString(), error });
     status.errors = status.errors.slice(0, 20);
-    io.emit("status", status);
+
   }
 }
 
@@ -233,9 +228,8 @@ app.get("/", (_req, res) => {
       </div>
     </div>
 
-    <script src="/socket.io/socket.io.js"></script>
     <script>
-      const socket = typeof io !== 'undefined' ? io() : null;
+      let refreshTimer = null;
 
       function setText(id, value) {
         document.getElementById(id).textContent = value;
@@ -267,12 +261,7 @@ app.get("/", (_req, res) => {
         );
       }
 
-      if (socket) {
-        socket.on("status", renderStatus);
-        socket.on("new_post", data => {
-          alert("New post detected:\n" + data.url);
-        });
-      }
+      
 
       window.startWatcher = async function () {
         const res = await fetch('/start', { method: 'POST' });
@@ -289,17 +278,20 @@ app.get("/", (_req, res) => {
       document.getElementById('startBtn').addEventListener('click', window.startWatcher);
       document.getElementById('stopBtn').addEventListener('click', window.stopWatcher);
 
-      fetch('/health').then(r => r.json()).then(data => renderStatus(data.status));
+      async function refreshStatus() {
+        const res = await fetch('/health');
+        const data = await res.json();
+        renderStatus(data.status);
+      }
+
+      refreshStatus();
+      refreshTimer = setInterval(refreshStatus, 3000);
     </script>
   </body>
 </html>`);
 });
 
-io.on("connection", socket => {
-  socket.emit("status", status);
-});
-
-server.listen(PORT, async () => {
+app.listen(PORT, async () => {
   console.log(`Watcher UI running on http://localhost:${PORT}`);
   await startWatcher();
 });
