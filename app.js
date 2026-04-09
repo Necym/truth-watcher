@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
 const PROFILE_URL = process.env.PROFILE_URL || "https://truthsocial.com/@realDonaldTrump";
 const POLL_MS = Number(process.env.POLL_MS || 10000);
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL || "";
@@ -16,11 +16,8 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
 
 let browser;
 let page;
-let timer = null;
-
-const status = {
+let status = {
   running: false,
-  startedAt: null,
   lastCheckAt: null,
   lastPostUrl: null,
   lastPostId: null,
@@ -37,11 +34,6 @@ function escapeHtml(str = "") {
     .replaceAll("'", "&#39;");
 }
 
-function pushLimited(arr, item, limit) {
-  arr.unshift(item);
-  if (arr.length > limit) arr.length = limit;
-}
-
 function extractPostLinks(hrefs) {
   const set = new Set();
   for (let href of hrefs) {
@@ -51,11 +43,10 @@ function extractPostLinks(hrefs) {
       set.add(href);
     }
   }
-
   return [...set].sort((a, b) => {
-    const aId = Number(a.split("/").pop());
-    const bId = Number(b.split("/").pop());
-    return bId - aId;
+    const ai = Number(a.split("/").pop());
+    const bi = Number(b.split("/").pop());
+    return bi - ai;
   });
 }
 
@@ -66,14 +57,13 @@ async function sendDiscord(message) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ content: message }),
   });
-  if (!res.ok) {
-    throw new Error(`Discord webhook failed with status ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`Discord webhook failed: ${res.status}`);
 }
 
 async function sendTelegram(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -82,9 +72,7 @@ async function sendTelegram(message) {
       disable_web_page_preview: true,
     }),
   });
-  if (!res.ok) {
-    throw new Error(`Telegram send failed with status ${res.status}`);
-  }
+  if (!res.ok) throw new Error(`Telegram send failed: ${res.status}`);
 }
 
 async function notifyNewPost(url) {
@@ -95,31 +83,23 @@ async function notifyNewPost(url) {
   ]);
 
   const failures = results
-    .filter((result) => result.status === "rejected")
-    .map((result) => result.reason?.message || String(result.reason));
+    .filter(r => r.status === "rejected")
+    .map(r => r.reason?.message || String(r.reason));
 
   if (failures.length) {
-    pushLimited(status.errors, {
-      at: new Date().toISOString(),
-      error: failures.join(" | "),
-    }, 20);
+    status.errors.unshift({ at: new Date().toISOString(), error: failures.join(" | ") });
+    status.errors = status.errors.slice(0, 20);
   }
 }
 
 async function ensureBrowser() {
-  if (browser && page) return;
-
-  browser = await chromium.launch({
-    headless: true,
-    args: ["--disable-dev-shm-usage", "--no-sandbox"],
-  });
-
+  if (browser) return;
+  browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     viewport: { width: 1400, height: 2000 },
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
   });
-
   page = await context.newPage();
 }
 
@@ -128,8 +108,8 @@ async function fetchLatestPost() {
   await page.goto(PROFILE_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
   await page.waitForTimeout(3000);
 
-  const hrefs = await page.$$eval("a", (els) =>
-    els.map((a) => a.href || a.getAttribute("href") || "").filter(Boolean)
+  const hrefs = await page.$$eval("a", els =>
+    els.map(a => a.href || a.getAttribute("href") || "").filter(Boolean)
   );
 
   const postLinks = extractPostLinks(hrefs);
@@ -142,10 +122,9 @@ async function fetchLatestPost() {
 
 async function pollOnce() {
   status.lastCheckAt = new Date().toISOString();
-
   try {
     const latest = await fetchLatestPost();
-    if (!latest) throw new Error("No matching post links found on profile page");
+    if (!latest) throw new Error("No post links found on page");
 
     if (!status.lastPostId) {
       status.lastPostId = latest.latestId;
@@ -153,26 +132,25 @@ async function pollOnce() {
     } else if (latest.latestId !== status.lastPostId) {
       status.lastPostId = latest.latestId;
       status.lastPostUrl = latest.latestUrl;
-
-      const event = { at: new Date().toISOString(), url: latest.latestUrl };
-      pushLimited(status.detections, event, 50);
-      io.emit("new_post", event);
+      status.detections.unshift({ at: new Date().toISOString(), url: latest.latestUrl });
+      status.detections = status.detections.slice(0, 50);
+      io.emit("new_post", { at: new Date().toISOString(), url: latest.latestUrl });
       await notifyNewPost(latest.latestUrl);
     }
-  } catch (error) {
-    pushLimited(status.errors, {
-      at: new Date().toISOString(),
-      error: error?.message || String(error),
-    }, 20);
-  }
 
-  io.emit("status", status);
+    io.emit("status", status);
+  } catch (err) {
+    const error = err?.message || String(err);
+    status.errors.unshift({ at: new Date().toISOString(), error });
+    status.errors = status.errors.slice(0, 20);
+    io.emit("status", status);
+  }
 }
 
+let timer = null;
 async function startWatcher() {
   if (timer) return;
   status.running = true;
-  status.startedAt = status.startedAt || new Date().toISOString();
   await pollOnce();
   timer = setInterval(() => {
     pollOnce().catch(() => {});
@@ -185,11 +163,11 @@ async function stopWatcher() {
   timer = null;
 }
 
-app.use(express.json());
-
 app.get("/health", (_req, res) => {
   res.json({ ok: true, status });
 });
+
+app.use(express.json());
 
 app.post("/start", async (_req, res) => {
   await startWatcher();
@@ -225,12 +203,12 @@ app.get("/", (_req, res) => {
   <body>
     <div class="wrap">
       <h1>Truth Social Watcher</h1>
-      <p class="muted">Web dashboard plus optional Discord and Telegram notifications for <code>${escapeHtml(PROFILE_URL)}</code>.</p>
+      <p class="muted">Web dashboard + live notifications for new posts from <code>${escapeHtml(PROFILE_URL)}</code>.</p>
 
       <div class="card">
         <div style="margin-bottom:12px;">
-          <button class="start" onclick="startWatcher()">Start</button>
-          <button class="stop" onclick="stopWatcher()">Stop</button>
+          <button id="startBtn" class="start">Start</button>
+          <button id="stopBtn" class="stop">Stop</button>
         </div>
         <div class="row">
           <div class="pill">Running: <span id="running">false</span></div>
@@ -257,7 +235,7 @@ app.get("/", (_req, res) => {
 
     <script src="/socket.io/socket.io.js"></script>
     <script>
-      const socket = io();
+      const socket = typeof io !== 'undefined' ? io() : null;
 
       function setText(id, value) {
         document.getElementById(id).textContent = value;
@@ -265,68 +243,68 @@ app.get("/", (_req, res) => {
 
       function renderList(id, items, mapper) {
         const el = document.getElementById(id);
-        el.innerHTML = items.length ? items.map(mapper).join("") : '<li class="muted">None</li>';
+        el.innerHTML = items.length
+          ? items.map(mapper).join("")
+          : '<li class="muted">None</li>';
       }
 
       function renderStatus(status) {
-        setText('running', String(status.running));
-        setText('lastCheck', status.lastCheckAt || 'never');
-
-        const latest = document.getElementById('latestUrl');
+        setText("running", String(status.running));
+        setText("lastCheck", status.lastCheckAt || "never");
+        const latest = document.getElementById("latestUrl");
         if (status.lastPostUrl) {
           latest.innerHTML = '<a href="' + status.lastPostUrl + '" target="_blank" rel="noopener noreferrer">' + status.lastPostUrl + '</a>';
         } else {
           latest.textContent = 'None yet';
         }
 
-        renderList('detections', status.detections || [], (item) =>
+        renderList("detections", status.detections || [], item =>
           '<li><a href="' + item.url + '" target="_blank" rel="noopener noreferrer">' + item.url + '</a> <span class="muted">(' + item.at + ')</span></li>'
         );
 
-        renderList('errors', status.errors || [], (item) =>
+        renderList("errors", status.errors || [], item =>
           '<li>' + item.error + ' <span class="muted">(' + item.at + ')</span></li>'
         );
       }
 
-      socket.on('status', renderStatus);
-      socket.on('new_post', (data) => {
-        alert('New post detected:\n' + data.url);
-      });
-
-      async function startWatcher() {
-        const response = await fetch('/start', { method: 'POST' });
-        const data = await response.json();
-        renderStatus(data.status);
+      if (socket) {
+        socket.on("status", renderStatus);
+        socket.on("new_post", data => {
+          alert("New post detected:\n" + data.url);
+        });
       }
 
-      async function stopWatcher() {
-        const response = await fetch('/stop', { method: 'POST' });
-        const data = await response.json();
+      window.startWatcher = async function () {
+        const res = await fetch('/start', { method: 'POST' });
+        const data = await res.json();
         renderStatus(data.status);
-      }
+      };
 
-      fetch('/health').then((r) => r.json()).then((data) => renderStatus(data.status));
+      window.stopWatcher = async function () {
+        const res = await fetch('/stop', { method: 'POST' });
+        const data = await res.json();
+        renderStatus(data.status);
+      };
+
+      document.getElementById('startBtn').addEventListener('click', window.startWatcher);
+      document.getElementById('stopBtn').addEventListener('click', window.stopWatcher);
+
+      fetch('/health').then(r => r.json()).then(data => renderStatus(data.status));
     </script>
   </body>
 </html>`);
 });
 
-io.on("connection", (socket) => {
+io.on("connection", socket => {
   socket.emit("status", status);
 });
 
 server.listen(PORT, async () => {
-  console.log(`Watcher running on port ${PORT}`);
+  console.log(`Watcher UI running on http://localhost:${PORT}`);
   await startWatcher();
 });
 
 process.on("SIGINT", async () => {
-  await stopWatcher();
-  if (browser) await browser.close();
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
   await stopWatcher();
   if (browser) await browser.close();
   process.exit(0);
